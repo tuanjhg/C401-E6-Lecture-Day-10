@@ -24,15 +24,13 @@ Hệ thống xử lý dữ liệu tin cậy cho Agent với 7 thành viên.
 | **Hải** | Khai báo Source Map (3 nguồn) trong `docs/data_contract.md`. | Source Map Draft |
 | **Long** | Khởi tạo `data_contract.yaml` với các thông tin Owner và Metadata cơ bản. | Contract Base |
 | **Thuận** | Setup `.env`, cấu trúc thư mục `chroma_db` và hàm kết nối collection. | DB Config |
-| **Huy** | Soạn thảo bộ 3-4 câu hỏi Golden Retrieval trong `test_questions.json`. | Golden Set |
+
 
 ### Sprint 2: Clean + Validate + Embed (60-120')
 *Mục tiêu: Xây dựng bộ lọc dữ liệu và nạp vào Vector DB không trùng lặp.*
 
 | Thành viên | Nhiệm vụ nâng cao | Sản phẩm |
 |------------|-------------------|----------|
-| **Tuấn** | Viết ≥ 6 rules làm sạch trong `cleaning_rules.py` (ISO date, HR version...). | Cleaning Rules |
-| **Quang** | Xử lý logic `Quarantine`: Đẩy record lỗi ra CSV riêng kèm lý do chi tiết. | Quarantine Logic |
 | **Hải** | Thiết lập bộ `expectations.py` để chặn đứng dữ liệu bẩn (Halt/Warn). | Validation Suite |
 | **Long** | Định nghĩa SLA Freshness và Alert Channel trong `data_contract.yaml`. | SLA Config |
 | **Thuận** | Viết hàm `Upsert` (theo hash) và **Logic Prune** (xóa vector cũ). | Idempotent code |
