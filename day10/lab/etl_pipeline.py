@@ -66,7 +66,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     log(f"run_id={run_id}")
     log(f"raw_records={raw_count}")
 
-    cleaned, quarantine = clean_rows(
+    cleaned, quarantine, metrics = clean_rows(
         rows,
         apply_refund_window_fix=not args.no_refund_fix,
     )
@@ -79,6 +79,18 @@ def cmd_run(args: argparse.Namespace) -> int:
     log(f"quarantine_records={len(quarantine)}")
     log(f"cleaned_csv={cleaned_path.relative_to(ROOT)}")
     log(f"quarantine_csv={quar_path.relative_to(ROOT)}")
+    
+    # Log quality metrics from cleaning rules (for anti-trivial verification)
+    for metric_key, metric_val in sorted(metrics.items()):
+        log(f"metric[{metric_key}]={metric_val}")
+    
+    # Check for stale refund window (halt condition from contract)
+    has_stale_refund = metrics.get("has_stale_refund", False)
+    if has_stale_refund and not args.no_refund_fix:
+        log("PIPELINE_HALT: stale refund window (14 ngày) detected in policy_refund_v4 — fix required (--no-refund-fix for demo only).")
+        return 2
+    if has_stale_refund and args.no_refund_fix:
+        log("WARN: stale refund window detected but --no-refund-fix → proceed (demo mode for before/after eval).")
 
     results, halt = run_expectations(cleaned)
     for r in results:

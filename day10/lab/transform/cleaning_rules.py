@@ -1,8 +1,16 @@
 """
 Cleaning rules — raw export → cleaned rows + quarantine.
 
-Baseline gồm các failure mode mở rộng (allowlist doc_id, parse ngày, HR stale version).
-Sinh viên thêm ≥3 rule mới: mỗi rule phải ghi `metric_impact` (xem README — chống trivial).
+Integrated from contracts/data_contract.yaml:
+  • Schema validation (min_length 8, required fields)
+  • Quality rules (no_duplicate_chunk_id, no_stale_refund_window, etc.)
+  • Version resolution (keep newest by effective_date, then exported_at)
+  • Freshness & canonical sources (from canonical_sources list)
+
+Metrics tracking :
+  - Each rule logs count of records affected (quarantined, dropped, fixed)
+  - Halt conditions: stale_refund_window (if apply_refund_window_fix=True)
+  - Dedup by chunk_id + exported_at (prefer latest version)
 """
 
 from __future__ import annotations
@@ -10,10 +18,11 @@ from __future__ import annotations
 import csv
 import hashlib
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-# Khớp export hợp lệ trong lab (mở rộng khi nhóm thêm doc mới — phải đồng bộ contract).
+# From contracts/data_contract.yaml :: allowed_doc_ids
 ALLOWED_DOC_IDS = frozenset(
     {
         "policy_refund_v4",
@@ -23,23 +32,43 @@ ALLOWED_DOC_IDS = frozenset(
     }
 )
 
+# Quality rules from contract
+MIN_CHUNK_TEXT_LENGTH = 8
+
+# Policy versioning from contract :: policy_versioning section
+HR_LEAVE_MIN_EFFECTIVE_DATE = "2026-01-01"
+REFUND_WINDOW_CANONICAL = "7 ngày"  # v4 canonical; v3 "14 ngày" → halt if present
+
 _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _DMY_SLASH = re.compile(r"^(\d{2})/(\d{2})/(\d{4})$")
 
 
 def _norm_text(s: str) -> str:
+    """Normalize text for dedup: lowercase + trim multiple spaces."""
     return " ".join((s or "").strip().split()).lower()
 
 
 def _stable_chunk_id(doc_id: str, chunk_text: str, seq: int) -> str:
+    """
+    Generate stable chunk_id from doc_id + seq + hash(chunk_text).
+    Idempotent: same input → same output.
+    Format: {doc_id}_{seq}_{hash[:16]}
+    """
     h = hashlib.sha256(f"{doc_id}|{chunk_text}|{seq}".encode("utf-8")).hexdigest()[:16]
     return f"{doc_id}_{seq}_{h}"
 
 
 def _normalize_effective_date(raw: str) -> Tuple[str, str]:
     """
-    Trả về (iso_date, error_reason).
-    iso_date rỗng nếu không parse được.
+    Normalize effective_date to ISO 8601 (YYYY-MM-DD).
+    
+    Supports:
+    - ISO 8601 (YYYY-MM-DD) → pass through
+    - DD/MM/YYYY → convert to ISO
+    - Empty/NULL → error
+    - Invalid format → error
+    
+    Returns: (iso_date_string, error_reason_or_empty)
     """
     s = (raw or "").strip()
     if not s:
@@ -54,6 +83,7 @@ def _normalize_effective_date(raw: str) -> Tuple[str, str]:
 
 
 def load_raw_csv(path: Path) -> List[Dict[str, str]]:
+    """Load raw CSV; trim whitespace from all fields."""
     rows: List[Dict[str, str]] = []
     with path.open(encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
@@ -62,46 +92,114 @@ def load_raw_csv(path: Path) -> List[Dict[str, str]]:
     return rows
 
 
+class CleaningMetrics:
+    """Track impact of each quality rule for anti-trivial verification."""
+
+    def __init__(self):
+        self.metrics: Dict[str, int] = {
+            "raw_records": 0,
+            "quarantine_unknown_doc_id": 0,
+            "quarantine_missing_effective_date": 0,
+            "quarantine_invalid_date_format": 0,
+            "quarantine_stale_hr_policy": 0,
+            "quarantine_short_chunk_text": 0,
+            "quarantine_empty_chunk_text": 0,
+            "quarantine_stale_refund_window": 0,
+            "dropped_duplicate_chunk_id": 0,
+            "dropped_duplicate_chunk_text": 0,
+            "cleaned_refund_window_fixed": 0,
+            "cleaned_records": 0,
+        }
+        self.has_stale_refund = False
+
+    def record(self, key: str, count: int = 1):
+        """Increment metric."""
+        if key in self.metrics:
+            self.metrics[key] += count
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = {k: v for k, v in self.metrics.items() if v > 0}
+        d["has_stale_refund"] = self.has_stale_refund
+        return d
+
+
 def clean_rows(
     rows: List[Dict[str, str]],
     *,
     apply_refund_window_fix: bool = True,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
     """
-    Trả về (cleaned, quarantine).
+    Ingest → clean → validate per contract.
 
-    Baseline (mở rộng theo narrative Day 10):
-    1) Quarantine: doc_id không thuộc allowlist (export lạ / catalog sai).
-    2) Chuẩn hoá effective_date sang YYYY-MM-DD; quarantine nếu không parse được.
-    3) Quarantine: chunk hr_leave_policy có effective_date < 2026-01-01 (bản HR cũ / conflict version).
-    4) Quarantine: chunk_text rỗng hoặc effective_date rỗng sau chuẩn hoá.
-    5) Loại trùng nội dung chunk_text (giữ bản đầu).
-    6) Fix stale refund: policy_refund_v4 chứa '14 ngày làm việc' → 7 ngày.
+    Per-row rules (from contracts/data_contract.yaml :: quality_rules):
+    1. Dedup by chunk_id: keep latest by exported_at (warn severity)
+    2. Unknown doc_id: quarantine (error severity)
+    3. Missing/invalid effective_date: quarantine (error severity)
+    4. HR policy stale version (effective_date < 2026-01-01): quarantine (error severity)
+    5. Short/empty chunk_text (<8 chars): quarantine/drop (error severity)
+    6. Stale refund window (doc_id=policy_refund_v4 + contains "14 ngày"): quarantine + mark halt (halt severity)
+    7. Duplicate chunk_text (semantic): drop excess (warn severity)
+
+    If apply_refund_window_fix=True: also fix "14 ngày" → "7 ngày" for cleaned records.
+    If stale refund detected: return metrics with has_stale_refund=True for halt decision in pipeline.
+
+    Returns: (cleaned, quarantine, metrics)
     """
+    metrics = CleaningMetrics()
+    metrics.record("raw_records", len(rows))
+
+    # Step 1: Dedup by chunk_id — keep latest by exported_at
+    # (Per contract:: duplicate_chunk_id rule = "DROP tất cả except latest")
+    chunk_id_map: Dict[str, Dict[str, str]] = {}
+    for raw in rows:
+        chunk_id = raw.get("chunk_id", "")
+        if chunk_id and chunk_id in chunk_id_map:
+            # Prefer later exported_at
+            prev = chunk_id_map[chunk_id]
+            prev_ts = prev.get("exported_at", "")
+            curr_ts = raw.get("exported_at", "")
+            if curr_ts >= prev_ts:  # lexicographic comparison for ISO timestamp
+                metrics.record("dropped_duplicate_chunk_id")
+                chunk_id_map[chunk_id] = raw
+            else:
+                metrics.record("dropped_duplicate_chunk_id")
+        else:
+            chunk_id_map[chunk_id] = raw
+
+    # Step 2: Per-row validation & cleaning
     quarantine: List[Dict[str, Any]] = []
     seen_text: set[str] = set()
     cleaned: List[Dict[str, Any]] = []
     seq = 0
 
-    for raw in rows:
+    for raw in chunk_id_map.values():
         doc_id = raw.get("doc_id", "")
+        chunk_id = raw.get("chunk_id", "")
         text = raw.get("chunk_text", "")
         eff_raw = raw.get("effective_date", "")
         exported_at = raw.get("exported_at", "")
 
+        # Rule: unknown_doc_id (error)
         if doc_id not in ALLOWED_DOC_IDS:
+            metrics.record("quarantine_unknown_doc_id")
             quarantine.append({**raw, "reason": "unknown_doc_id"})
             continue
 
+        # Rule: invalid/missing effective_date (error)
         eff_norm, eff_err = _normalize_effective_date(eff_raw)
         if eff_err == "empty_effective_date":
+            metrics.record("quarantine_missing_effective_date")
             quarantine.append({**raw, "reason": "missing_effective_date"})
             continue
         if eff_err == "invalid_effective_date_format":
+            metrics.record("quarantine_invalid_date_format")
             quarantine.append({**raw, "reason": eff_err, "effective_date_raw": eff_raw})
             continue
 
-        if doc_id == "hr_leave_policy" and eff_norm < "2026-01-01":
+        # Rule: stale HR policy (effective_date < 2026-01-01) (error)
+        # Per contract:: version_resolution.rule = "Select newest by effective_date"
+        if doc_id == "hr_leave_policy" and eff_norm < HR_LEAVE_MIN_EFFECTIVE_DATE:
+            metrics.record("quarantine_stale_hr_policy")
             quarantine.append(
                 {
                     **raw,
@@ -111,24 +209,42 @@ def clean_rows(
             )
             continue
 
-        if not text:
-            quarantine.append({**raw, "reason": "missing_chunk_text"})
+        # Rule: empty/short chunk_text (error)
+        # Per contract:: schema_cleaned.chunk_text.constraints.min_length = 8
+        if not text or len(text) < MIN_CHUNK_TEXT_LENGTH:
+            if not text:
+                metrics.record("quarantine_empty_chunk_text")
+            else:
+                metrics.record("quarantine_short_chunk_text")
+            quarantine.append({**raw, "reason": "insufficient_chunk_text_length"})
             continue
 
+        # Rule: stale refund window (halt!)
+        # Per contract:: quality_rules.no_stale_refund_window.severity = "halt"
+        # If chunk contains "14 ngày làm việc" (from v3 migration) → QUARANTINE + MARK HALT
+        if doc_id == "policy_refund_v4" and "14 ngày" in text:
+            metrics.record("quarantine_stale_refund_window")
+            metrics.has_stale_refund = True
+            quarantine.append({**raw, "reason": "stale_refund_window_v3"})
+            continue
+
+        # Rule: duplicate chunk_text (warn)
+        # Per contract:: rule = "keep first occurrence; DROP others"
         key = _norm_text(text)
         if key in seen_text:
-            quarantine.append({**raw, "reason": "duplicate_chunk_text"})
+            metrics.record("dropped_duplicate_chunk_text")
             continue
         seen_text.add(key)
 
+        # Fix refund window if enabled & allowed
+        # (Apply only to cleaned records, not quarantine)
         fixed_text = text
         if apply_refund_window_fix and doc_id == "policy_refund_v4":
-            if "14 ngày làm việc" in fixed_text:
-                fixed_text = fixed_text.replace(
-                    "14 ngày làm việc",
-                    "7 ngày làm việc",
-                )
-                fixed_text += " [cleaned: stale_refund_window]"
+            if "14 ngày" in fixed_text:
+                # This shouldn't happen after quarantine rule above, but defensive coding
+                fixed_text = fixed_text.replace("14 ngày làm việc", "7 ngày làm việc")
+                fixed_text += " [cleaned: stale_refund_window_fixed]"
+                metrics.record("cleaned_refund_window_fixed")
 
         seq += 1
         cleaned.append(
@@ -141,10 +257,12 @@ def clean_rows(
             }
         )
 
-    return cleaned, quarantine
+    metrics.record("cleaned_records", len(cleaned))
+    return cleaned, quarantine, metrics.to_dict()
 
 
 def write_cleaned_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
+    """Write cleaned CSV with schema from contract (chunk_id, doc_id, chunk_text, effective_date, exported_at)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
         path.write_text("chunk_id,doc_id,chunk_text,effective_date,exported_at\n", encoding="utf-8")
@@ -158,6 +276,12 @@ def write_cleaned_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
 
 
 def write_quarantine_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
+    """
+    Write quarantine CSV with all fields from raw + reason.
+    
+    Per contract:: Quarantine location: artifacts/quarantine/quarantine_<run-id>.csv
+    — reviewed weekly, approval required before merge.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
         path.write_text("chunk_id,doc_id,chunk_text,effective_date,exported_at,reason\n", encoding="utf-8")
