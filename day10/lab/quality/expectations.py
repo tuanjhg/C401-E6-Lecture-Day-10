@@ -79,6 +79,38 @@ def run_expectations(cleaned_rows: List[Dict[str, Any]]) -> Tuple[List[Expectati
         )
     )
 
+    # E7: không có doc_id ngoài danh sách cho phép
+    allowed_doc_ids = {"policy_refund_v4", "sla_p1_2026", "it_helpdesk_faq", "hr_leave_policy"}
+    bad_docid = [r for r in cleaned_rows if r.get("doc_id") not in allowed_doc_ids]
+    ok7 = len(bad_docid) == 0
+    results.append(
+        ExpectationResult(
+            "no_unknown_doc_id",
+            ok7,
+            "halt",
+            f"unknown_doc_id_count={len(bad_docid)}",
+        )
+    )
+
+    # E8: không có chunk_id trùng lặp
+    seen_chunk_ids = set()
+    dup_chunk_ids = set()
+    for r in cleaned_rows:
+        cid = r.get("chunk_id")
+        if cid in seen_chunk_ids:
+            dup_chunk_ids.add(cid)
+        else:
+            seen_chunk_ids.add(cid)
+    ok8 = len(dup_chunk_ids) == 0
+    results.append(
+        ExpectationResult(
+            "no_duplicate_chunk_id",
+            ok8,
+            "halt",
+            f"duplicate_chunk_ids={list(dup_chunk_ids)}",
+        )
+    )
+
     # E5: effective_date đúng định dạng ISO sau clean (phát hiện parser lỏng)
     iso_bad = [
         r
