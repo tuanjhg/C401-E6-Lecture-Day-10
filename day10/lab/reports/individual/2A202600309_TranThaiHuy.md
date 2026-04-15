@@ -8,62 +8,54 @@
 
 ---
 
-## 1. Tôi phụ trách phần nào?
+## 1. Tôi phụ trách phần nào? (≈110 từ)
 
-Tôi phụ trách mảng **evaluation/evidence** để chứng minh pipeline Day 10 “feed đúng data” cho tầng retrieval/agent. Cụ thể, tôi chịu trách nhiệm chạy và lưu các artifacts cho 2 kịch bản:
+Tôi phụ trách phần **đánh giá (evaluation) và bằng chứng (evidence)** để chứng minh pipeline Day 10 ảnh hưởng trực tiếp đến retrieval/agent ở tầng trên. Công việc của tôi là chạy pipeline theo 2 kịch bản (clean vs inject-bad), sinh ra artifacts liên quan (log/manifest/eval CSV), và dùng các chỉ số `contains_expected`, `hits_forbidden`, `top1_doc_expected` để kết luận “trước/sau” một cách định lượng.
 
-- **Pipeline chuẩn (after / good run)**: chạy `etl_pipeline.py run` để clean + expectation pass + embed Chroma, sau đó chạy `eval_retrieval.py` để lấy kết quả retrieval theo bộ golden questions.
-- **Inject corruption (before / inject-bad)**: chạy pipeline với `--no-refund-fix --skip-validate` để cố ý tạo tình huống “dirty index”, rồi chạy `eval_retrieval.py` để thấy khác biệt định lượng trước/sau.
-
-Tôi cũng tổng hợp evidence vào báo cáo nhóm/quality report (run_id + đường dẫn artifacts + số liệu trước/sau) và hỗ trợ xử lý xung đột/logic liên quan đến scenario inject để kết quả eval phản ánh đúng ý đồ Sprint 3.
-
-**Bằng chứng artifacts (run_id):**
-- `run_id=good`: `artifacts/logs/run_good.log`, `artifacts/manifests/manifest_good.json`
-- `run_id=inject-bad`: `artifacts/logs/run_inject-bad.log`, `artifacts/manifests/manifest_inject-bad.json`
+**File tôi trực tiếp sử dụng/đối chiếu:**
+- `eval_retrieval.py` + `data/test_questions.json` để chạy retrieval eval.
+- Artifacts theo run: `artifacts/logs/run_good.log`, `artifacts/logs/run_inject-bad.log`, `artifacts/manifests/manifest_good.json`, `artifacts/manifests/manifest_inject-bad.json`.
+- Output eval: `artifacts/eval/before_after_eval.csv`, `artifacts/eval/after_inject_bad.csv`.
 
 ---
 
-## 2. Một quyết định kỹ thuật
+## 2. Một quyết định kỹ thuật (≈140 từ)
 
-Quyết định quan trọng của tôi là **tách rõ 2 mode đánh giá** để vừa có “index canonical” cho Sprint 2, vừa có “bad scenario” cho Sprint 3:
+Quyết định quan trọng là **tách rõ 2 mode chạy** để phục vụ đúng mục tiêu Sprint 2 và Sprint 3:
 
-- **Normal mode (pipeline chuẩn)** phải **auto-fix** lỗi “refund window 14→7 ngày” để expectation pass và embed được index sạch (đảm bảo hệ tầng trên không còn đọc policy stale).
-- **Inject mode** phải **giữ 14 ngày** (không fix) và cho phép bypass halt (`--skip-validate`) để cố ý embed “dirty index”. Nhờ vậy, eval có thể đo `hits_forbidden=yes` cho câu `q_refund_window` và tạo được before/after evidence.
+- **Pipeline chuẩn (Sprint 2)**: phải tạo index “canonical” để agent không đọc policy stale. Vì vậy dữ liệu refund “14 ngày” cần được **auto-fix về 7 ngày** trước khi embed, expectation `refund_no_stale_14d_window` phải PASS, và ChromaDB nhận snapshot sạch.
+- **Inject-bad (Sprint 3)**: cần cố ý giữ lỗi để tạo before/after measurable. Do đó dùng `--no-refund-fix --skip-validate` để expectation E3 FAIL nhưng vẫn embed “dirty index”, từ đó eval nhìn thấy `hits_forbidden=yes` và chứng minh nguy cơ “mồi cũ” trong top-k.
 
-Trade-off: logic phức tạp hơn so với chỉ “halt” ngay, nhưng phù hợp mục tiêu lab: vừa vận hành được pipeline chuẩn, vừa chứng minh tác động data quality lên retrieval.
-
----
-
-## 3. Một lỗi/anomaly đã xử lý
-
-**Triệu chứng:** Pipeline chuẩn bị **HALT** vì phát hiện stale refund window (“14 ngày”) trong raw export, khiến Sprint 2 không đi tới embed/eval được.
-
-**Dấu hiệu trong log:** `PIPELINE_HALT: stale refund window (14 ngày) detected...` (pipeline dừng trước embed).
-
-**Cách xử lý:** Điều chỉnh logic cleaning/refund để normal run tự fix về “7 ngày” (expectation E3 pass), còn inject-bad thì giữ “14 ngày” để E3 fail (nhưng vẫn embed khi `--skip-validate`). Sau khi xử lý, pipeline `run_id=good` có:
-- `expectation[refund_no_stale_14d_window] OK (halt) :: violations=0`
-- `embed_upsert count=7 collection=day10_kb`
+Trade-off: phức tạp hơn so với chỉ “halt luôn”, nhưng phù hợp lab vì vừa chạy được pipeline chuẩn, vừa có kịch bản demo lỗi.
 
 ---
 
-## 4. Bằng chứng trước / sau
+## 3. Một lỗi/anomaly đã xử lý (≈120 từ)
 
-**Before (inject-bad):** `artifacts/logs/run_inject-bad.log`
-- `expectation[refund_no_stale_14d_window] FAIL (halt) :: violations=1`
-- `WARN: expectation failed but --skip-validate -> tiếp tục embed`
+Anomaly tôi gặp là pipeline có thể bị **HALT** khi phát hiện stale refund window (“14 ngày”) nếu logic fix/validation không được tách rõ theo mode. Khi đó Sprint 2 không đi tới embed nên không thể chạy eval.
 
-**After (good):** `artifacts/logs/run_good.log`
-- `expectation[refund_no_stale_14d_window] OK (halt) :: violations=0`
+Tôi kiểm tra bằng cách đọc log và metrics:
+- `metric[stale_refund_window_detected]=1` (phát hiện chunk stale)
+- Ở inject-bad, expectation E3 FAIL nhưng có `--skip-validate` để tiếp tục embed.
 
-**Retrieval eval (điền số liệu từ CSV):**
-- File after (good): `artifacts/eval/before_after_eval.csv` → `q_refund_window`: `hits_forbidden=no`
-- File before (inject-bad): `artifacts/eval/after_inject_bad.csv` → `q_refund_window`: `hits_forbidden=yes`
-
-> Nếu thiếu 2 file CSV trên do merge/cleanup, chỉ cần chạy lại `python eval_retrieval.py --out ...` cho từng scenario để regenerate và paste 2 dòng tương ứng vào report.
+Sau khi điều chỉnh cách chạy theo đúng mode (good vs inject-bad), pipeline chuẩn (`run_id=good`) có `expectation[refund_no_stale_14d_window] OK ... violations=0` và `embed_upsert count=7`, đảm bảo eval có thể chạy.
 
 ---
 
-## 5. Cải tiến tiếp theo
+## 4. Bằng chứng trước / sau (≈110 từ)
 
-Nếu có thêm 2 giờ, tôi sẽ (1) mở rộng eval theo “slice” nhiều câu hơn (≥5) để giảm phụ thuộc keyword; (2) thêm một bước “eval snapshot” ghi `run_id + commit_sha + collection_count` để trace evidence chắc chắn; và (3) chuẩn hoá output CSV có cột `scenario` để gộp before/after vào một file phục vụ đọc nhanh trong group report.
+**Before (inject-bad)** — `run_id=inject-bad`:
+- Log: `expectation[refund_no_stale_14d_window] FAIL (halt) :: violations=1` và `--skip-validate` để vẫn embed.
+- Eval CSV `artifacts/eval/after_inject_bad.csv`: `q_refund_window` có `contains_expected=yes` nhưng `hits_forbidden=yes` (top-k vẫn dính “14 ngày”).
 
+**After (pipeline chuẩn)** — `run_id=good`:
+- Log: `metric[cleaned_refund_window_fixed]=1`, expectation E3 OK, `embed_upsert count=7`.
+- Eval CSV `artifacts/eval/before_after_eval.csv`: `q_refund_window` có `contains_expected=yes` và `hits_forbidden=no` (index sạch hơn).
+
+Ý nghĩa: inject-bad chứng minh “data lỗi” làm retrieval kéo nhầm chunk stale; pipeline chuẩn loại/fix nên retrieval sạch.
+
+---
+
+## 5. Cải tiến tiếp theo (≈60 từ)
+
+Nếu có thêm 2 giờ, tôi sẽ mở rộng eval theo 2 hướng: (1) thêm cột `scenario` để gộp before/after vào một CSV duy nhất, thuận tiện đọc và chấm; (2) tăng bộ câu hỏi (≥5) theo slice (refund/HR/IT/SLA) để tránh phụ thuộc 1 câu then chốt và có cái nhìn ổn định hơn về chất lượng retrieval.
