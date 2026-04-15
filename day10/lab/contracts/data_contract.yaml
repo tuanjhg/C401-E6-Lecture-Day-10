@@ -3,7 +3,8 @@
 
 version: "1.0"
 dataset: "kb_chunk_export"
-owner_team: "__TODO__"
+owner_team: "Data Platform & Policy Team"
+owner_contact: "data-platform@internal.com"
 
 schema_cleaned:
   chunk_id:
@@ -32,11 +33,27 @@ quality_rules:
   - id: "no_stale_refund_window"
     description: "Không được để chunk policy refund chứa cửa sổ 14 ngày (lệch so với v4 = 7 ngày)"
     severity: "halt"
+  - id: "empty_chunk_text"
+    description: "chunk_text phải có độ dài >= 8 ký tự; NULL hoặc empty → DROP"
+    severity: "error"
+  - id: "unknown_doc_id"
+    description: "doc_id phải trong allowed_doc_ids; unknown → QUARANTINE"
+    severity: "error"
+  - id: "missing_effective_date"
+    description: "effective_date không được NULL; missing → QUARANTINE"
+    severity: "error"
+  - id: "invalid_date_format"
+    description: "effective_date phải ISO 8601 (YYYY-MM-DD) hoặc DD/MM/YYYY (parse); invalid → QUARANTINE"
+    severity: "error"
+  - id: "duplicate_chunk_id"
+    description: "Dedup by chunk_id; giữ latest by exported_at, DROP tất cả records cũ"
+    severity: "warn"
 
 freshness:
   measured_at: "publish"  # ingest | cleaned | publish
   sla_hours: 24
-  alert_channel: "__TODO__"
+  alert_channel: "#data-quality-alerts"
+  grace_period_hours: 2
 
 canonical_sources:
   - path: "data/docs/policy_refund_v4.txt"
@@ -55,6 +72,41 @@ allowed_doc_ids:
   - it_helpdesk_faq
   - hr_leave_policy
 
-# Merit/Distinction: có thể đưa cutoff versioning vào env và tham chiếu ở đây (tránh hard-code trong code).
+# Sources from raw data NOT in allowlist — tự động quarantine
+rejected_sources:
+  - legacy_catalog_xyz_zzz:
+      reason: "Unknown/deprecated legacy system; not in approved list"
+      action: "QUARANTINE all records"
+      approval_required: "Data Owner verify source + metadata"
 policy_versioning:
   hr_leave_min_effective_date: "2026-01-01"
+  refund_window_canonical: "7_days"  # v4 canonical; v3 "14 days" → quarantine
+
+version_resolution:
+  rule: "Select newest by effective_date (tie-breaker: latest exported_at)"
+  examples:
+    hr_leave_2_versions: "row 7 (2025-01-01, 10 days) vs row 8 (2026-02-01, 12 days) → keep row 8 only"
+    refund_stale_chunk: "chunk_id=3 (14 days from v3 migration) → QUARANTINE + HALT"
+
+source_sla:
+  policy_refund_v4:
+    refresh_frequency: "daily"
+    lag_tolerance_hours: 12
+    owner: "Policy Team"
+  hr_leave_policy:
+    refresh_frequency: "monthly"
+    lag_tolerance_hours: 48
+    owner: "HR Team"
+  it_helpdesk_faq:
+    refresh_frequency: "weekly"
+    lag_tolerance_hours: 24
+    owner: "IT Service Desk"
+  sla_p1_2026:
+    refresh_frequency: "static"
+    lag_tolerance_hours: 720
+    owner: "Service Management Team"
+
+# Detailed governance & quarantine rules → see docs/data_contract.md (Sections 3–4)
+# - Quarantine process: Section 3 (7 rules, approval workflow)
+# - Canonical versioning: Section 4.2 (version conflicts resolution)
+# - Freshness SLA & validation: Section 4.3
